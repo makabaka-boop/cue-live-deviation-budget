@@ -68,7 +68,11 @@ export function parseCompareBody(body: unknown): CompareRequest {
   };
 }
 
-function parseInt32Array(value: unknown, field: 'a' | 'b'): number[] {
+export function parseInt32Array(
+  value: unknown,
+  field: string,
+  elementCode: ErrorCode = 'INVALID_ELEMENT',
+): number[] {
   if (!Array.isArray(value)) {
     throw new ApiError(
       'INVALID_BODY',
@@ -90,7 +94,7 @@ function parseInt32Array(value: unknown, field: 'a' | 'b'): number[] {
       v > LIMITS.INT32_MAX
     ) {
       throw new ApiError(
-        'INVALID_ELEMENT',
+        elementCode,
         `Element "${field}[${i}]" must be a 32-bit signed integer.`,
       );
     }
@@ -180,6 +184,38 @@ function asCue(value: unknown): number {
   return value;
 }
 
+/**
+ * Optional plan attached to a create command. A session either gets a plan
+ * and a tolerance (both present) or neither — the old flow for plain shows.
+ */
+export interface CreatePlan {
+  plan: number[];
+  k: number;
+}
+
+/**
+ * Parse the optional `plan` / `k` pair on a create envelope. Both fields
+ * absent means a legacy session with no deviation tracking; exactly one
+ * present, a malformed array or an out-of-range k rejects the envelope and
+ * never creates the session.
+ */
+function parseCreatePlan(obj: Record<string, unknown>): CreatePlan | undefined {
+  const hasPlan = Object.prototype.hasOwnProperty.call(obj, 'plan');
+  const hasK = Object.prototype.hasOwnProperty.call(obj, 'k');
+  if (!hasPlan && !hasK) return undefined;
+  if (!hasPlan) {
+    invalidBody('Field "plan" is required when "k" is provided.');
+  }
+  if (!hasK) {
+    invalidBody('Field "k" is required when "plan" is provided.');
+  }
+  // Plan elements use INVALID_ELEMENT / ARRAY_TOO_LONG, the same stable codes
+  // as the standalone distance API.
+  const plan = parseInt32Array(obj.plan, 'plan');
+  const k = parseK(obj.k);
+  return { plan, k };
+}
+
 export function parsePerformanceCommand(body: unknown): PerformanceCommand {
   const obj = asObject(body);
   const requestId = asNonEmptyString(obj.requestId, 'requestId');
@@ -193,7 +229,14 @@ export function parsePerformanceCommand(body: unknown): PerformanceCommand {
       if (name.length > NAME_MAX_LENGTH) {
         invalidBody(`Field "name" must be at most ${NAME_MAX_LENGTH} characters.`);
       }
-      return { type: 'create', name, requestId };
+      const planned = parseCreatePlan(obj);
+      return {
+        type: 'create',
+        name,
+        requestId,
+        plan: planned?.plan,
+        k: planned?.k,
+      };
     }
     case 'transition': {
       const performanceId = asNonEmptyString(obj.performanceId, 'performanceId');

@@ -12,7 +12,12 @@
  *      "two sessions", "create vs modify" and "retarget after commit"
  *      groups, checking success counts, the first-owner attribution,
  *      per-session snapshots and the duplicate error verdict,
- *   7. the host-published WEB_PORT override reaches the same stack.
+ *   7. planned sessions: per-cue prefix boundary checked against a full-DP
+ *      oracle, end-of-show full-plan verdict, monotonic "unrecoverable",
+ *      pause/retry/replay/conflict never advancing the distance state,
+ *      cross-session plan independence, fixed-plan immutability, planned
+ *      create envelope validation and legacy (no-plan) compatibility,
+ *   8. the host-published WEB_PORT override reaches the same stack.
  *
  * Exits 0 when every check passes, 1 otherwise.
  */
@@ -957,7 +962,359 @@ for (const [order, firstLabel] of [
   );
 }
 
-console.log('\n[7] published WEB_PORT override');
+console.log('\n[7] planned sessions: incremental boundary, pause/retry, cross-session, legacy');
+
+/**
+ * Full O(n*m) DP oracle (ins/del 1, sub 2) for SHORT sequences. It returns
+ * the exact prefix minimum min_j D(live, plan[0..j)) and the full-plan
+ * distance D(live, plan). The production tracker is a banded incremental DP;
+ * this oracle is deliberately a different, complete implementation that the
+ * per-cue snapshots are checked against one cue at a time.
+ */
+function oracleReading(plan, live) {
+  const n = live.length;
+  const m = plan.length;
+  const d = [Array.from({ length: m + 1 }, (_, j) => j)];
+  for (let i = 1; i <= n; i++) {
+    const row = new Array(m + 1);
+    row[0] = i;
+    for (let j = 1; j <= m; j++) {
+      row[j] = Math.min(
+        d[i - 1][j] + 1,
+        row[j - 1] + 1,
+        d[i - 1][j - 1] + (live[i - 1] === plan[j - 1] ? 0 : 2),
+      );
+    }
+    d.push(row);
+  }
+  let prefix = d[n][0];
+  for (let j = 1; j <= m; j++) prefix = Math.min(prefix, d[n][j]);
+  return { prefix, final: d[n][m] };
+}
+
+function expectReading(checkName, reading, exact, k) {
+  if (exact <= k) {
+    check(checkName, reading?.status === 'ok' && reading.distance === exact,
+      `got ${JSON.stringify(reading)}, expected ok ${exact}`);
+  } else {
+    check(checkName, reading?.status === 'exceeded',
+      `got ${JSON.stringify(reading)}, expected exceeded (exact ${exact} > k ${k})`);
+  }
+}
+
+// --- 7a: every committed cue is checked against the full-DP oracle --------
+{
+  const plan = [101, 102, 103, 104, 105];
+  const k = 2;
+  const create = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '计划场次-逐条预言机',
+    plan,
+    k,
+    requestId: commandRequestId('vp-create'),
+  });
+  check(
+    'planned create carries the fixed plan and zero-row readings',
+    create.status === 200 &&
+      JSON.stringify(create.body?.performance?.deviation?.plan) === JSON.stringify(plan) &&
+      create.body?.performance?.deviation?.k === k &&
+      create.body?.performance?.deviation?.planLength === plan.length &&
+      create.body?.performance?.deviation?.prefix?.status === 'ok' &&
+      create.body?.performance?.deviation?.prefix?.distance === 0,
+    `got ${JSON.stringify(create.body)}`,
+  );
+  const id = create.body.performance.id;
+
+  const start = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('vp-start'),
+  });
+  check('planned session start -> v2', start.status === 200 &&
+    start.body?.performance?.version === 2, JSON.stringify(start.body));
+
+  // One inserted extra cue (202) then the rest of the plan: recoverable at
+  // every step, full-plan distance ends at exactly 1.
+  const live = [101, 102, 202, 103, 104, 105];
+  for (let i = 0; i < live.length; i++) {
+    const res = await sendCommand(WEB_URL, {
+      command: 'registerCue', performanceId: id, cue: live[i],
+      expectedVersion: 2 + i, requestId: commandRequestId(`vp-cue-${i}`),
+    });
+    const p = res.body?.performance;
+    const seen = live.slice(0, i + 1);
+    const oracle = oracleReading(plan, seen);
+    check(
+      `planned cue ${i + 1}: snapshot version/cues/deviation are one version`,
+      res.status === 200 &&
+        p.version === 3 + i &&
+        JSON.stringify(p.cues) === JSON.stringify(seen) &&
+        JSON.stringify(p.deviation.plan) === JSON.stringify(plan),
+      `got ${JSON.stringify(p)}`,
+    );
+    expectReading(`planned cue ${i + 1}: prefix boundary matches oracle`, p.deviation.prefix, oracle.prefix, k);
+    expectReading(`planned cue ${i + 1}: full-plan reading matches oracle`, p.deviation.final, oracle.final, k);
+  }
+
+  const end = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'ended',
+    expectedVersion: 8, requestId: commandRequestId('vp-end'),
+  });
+  const oracleEnd = oracleReading(plan, live);
+  check('planned session sealed v9', end.status === 200 &&
+    end.body?.performance?.status === 'ended' &&
+    end.body?.performance?.version === 9, JSON.stringify(end.body));
+  expectReading('sealed verdict = exact full-plan distance (1)',
+    end.body?.performance?.deviation?.final, oracleEnd.final, k);
+  // GET after refresh serves the same sealed verdict and fixed plan.
+  const reloaded = await getPerformance(WEB_URL, id);
+  check(
+    'reload keeps fixed plan + sealed verdict together',
+    JSON.stringify(reloaded.body?.performance?.deviation?.plan) === JSON.stringify(plan) &&
+      reloaded.body?.performance?.deviation?.final?.distance === 1 &&
+      reloaded.body?.performance?.version === 9,
+    JSON.stringify(reloaded.body),
+  );
+}
+
+// --- 7b: crossing the boundary mid-show is permanent; replay/conflict freeze it
+{
+  const plan = [1, 2, 3];
+  const k = 1;
+  const create = await sendCommand(WEB_URL, {
+    command: 'create', name: '计划场次-中途超限', plan, k,
+    requestId: commandRequestId('vx-create'),
+  });
+  const id = create.body.performance.id;
+  // Run-unique but reused within this scenario: rejected (paused) ->
+  // reusable after resume -> committed -> duplicate on replay.
+  const pausedCueId = commandRequestId('vx-paused-cue');
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('vx-start'),
+  });
+
+  // Pause first: a transition must not advance the distance frontier.
+  const pause = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'paused',
+    expectedVersion: 2, requestId: commandRequestId('vx-pause'),
+  });
+  check('pause -> v3 with zero-cue readings intact', pause.status === 200 &&
+    pause.body?.performance?.version === 3 &&
+    pause.body?.performance?.deviation?.prefix?.distance === 0 &&
+    pause.body?.performance?.cues?.length === 0, JSON.stringify(pause.body));
+
+  // Cue while paused is rejected and advances nothing.
+  const pausedCue = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 9,
+    expectedVersion: 3, requestId: pausedCueId,
+  });
+  check('cue while paused -> NOT_RUNNING', pausedCue.status === 409 &&
+    pausedCue.body?.error?.reason === 'NOT_RUNNING', JSON.stringify(pausedCue.body));
+  const whilePaused = await getPerformance(WEB_URL, id);
+  check('refused paused cue leaves cues/version/verdict untouched',
+    whilePaused.body?.performance?.version === 3 &&
+      whilePaused.body?.performance?.cues?.length === 0 &&
+      whilePaused.body?.performance?.deviation?.prefix?.distance === 0,
+    JSON.stringify(whilePaused.body));
+
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 3, requestId: commandRequestId('vx-resume'),
+  });
+
+  // Same rejected request id is reusable after resume: commits exactly once.
+  const cue9 = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 9,
+    expectedVersion: 4, requestId: pausedCueId,
+  });
+  {
+    const o = oracleReading(plan, [9]);
+    check('reused rejected id commits after resume -> v5, boundary oracle',
+      cue9.status === 200 && cue9.body?.performance?.version === 5,
+      JSON.stringify(cue9.body));
+    expectReading('after cue 9 prefix still recoverable (1)',
+      cue9.body?.performance?.deviation?.prefix, o.prefix, k);
+  }
+
+  const cue8 = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 8,
+    expectedVersion: 5, requestId: commandRequestId('vx-cue8'),
+  });
+  {
+    const o = oracleReading(plan, [9, 8]);
+    expectReading('after cue 8 prefix exceeds k -> unrecoverable',
+      cue8.body?.performance?.deviation?.prefix, o.prefix, k);
+    check('cue 8 snapshot flags exceeded',
+      cue8.body?.performance?.deviation?.prefix?.status === 'exceeded',
+      JSON.stringify(cue8.body));
+  }
+
+  // A matching cue afterwards cannot rescue a show already past the boundary.
+  const cue1 = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 1,
+    expectedVersion: 6, requestId: commandRequestId('vx-cue1'),
+  });
+  check('late matching cue does not restore recoverability',
+    cue1.body?.performance?.deviation?.prefix?.status === 'exceeded' &&
+      cue1.body?.performance?.version === 7,
+    JSON.stringify(cue1.body));
+
+  // Replaying the committed cue-9 id is a duplicate and moves no frontier.
+  const replay = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 9,
+    expectedVersion: 7, requestId: pausedCueId,
+  });
+  check('committed cue id replay -> DUPLICATE_REQUEST, no second advance',
+    replay.status === 409 && replay.body?.error?.reason === 'DUPLICATE_REQUEST',
+    JSON.stringify(replay.body));
+
+  // A stale version is rejected and freezes the verdict too.
+  const stale = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 2,
+    expectedVersion: 2, requestId: commandRequestId('vx-stale'),
+  });
+  check('stale version cue -> VERSION_CONFLICT', stale.status === 409 &&
+    stale.body?.error?.reason === 'VERSION_CONFLICT', JSON.stringify(stale.body));
+  const frozen = await getPerformance(WEB_URL, id);
+  check('state frozen after replay/conflict: v7, cues [9,8,1], still exceeded',
+    frozen.body?.performance?.version === 7 &&
+      JSON.stringify(frozen.body?.performance?.cues) === JSON.stringify([9, 8, 1]) &&
+      frozen.body?.performance?.deviation?.prefix?.status === 'exceeded',
+    JSON.stringify(frozen.body));
+
+  const end = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'ended',
+    expectedVersion: 7, requestId: commandRequestId('vx-end'),
+  });
+  expectReading('sealed exceeded verdict against the full plan (exact 4)',
+    end.body?.performance?.deviation?.final, oracleReading(plan, [9, 8, 1]).final, k);
+}
+
+// --- 7c: cross-session plans and verdicts never mix -----------------------
+{
+  const a = await sendCommand(WEB_URL, {
+    command: 'create', name: '计划场次-A', plan: [1, 2, 3], k: 1,
+    requestId: commandRequestId('va-create'),
+  });
+  const b = await sendCommand(WEB_URL, {
+    command: 'create', name: '计划场次-B', plan: [7, 8, 9], k: 1,
+    requestId: commandRequestId('vb-create'),
+  });
+  const idA = a.body.performance.id;
+  const idB = b.body.performance.id;
+  for (const [id, label] of [[idA, 'a'], [idB, 'b']]) {
+    await sendCommand(WEB_URL, {
+      command: 'transition', performanceId: id, status: 'running',
+      expectedVersion: 1, requestId: commandRequestId(`vab-start-${label}`),
+    });
+  }
+  await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: idA, cue: 1,
+    expectedVersion: 2, requestId: commandRequestId('va-cue1'),
+  });
+  await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: idB, cue: 99,
+    expectedVersion: 2, requestId: commandRequestId('vb-cue1'),
+  });
+  await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: idB, cue: 98,
+    expectedVersion: 3, requestId: commandRequestId('vb-cue2'),
+  });
+
+  const snapA = await getPerformance(WEB_URL, idA);
+  const snapB = await getPerformance(WEB_URL, idB);
+  check('A keeps its own plan and recoverable verdict while B goes off plan',
+    JSON.stringify(snapA.body?.performance?.deviation?.plan) === JSON.stringify([1, 2, 3]) &&
+      snapA.body?.performance?.deviation?.prefix?.status === 'ok' &&
+      snapA.body?.performance?.deviation?.prefix?.distance === 0 &&
+      snapA.body?.performance?.version === 3,
+    JSON.stringify(snapA.body));
+  check('B keeps its own plan and its exceeded verdict',
+    JSON.stringify(snapB.body?.performance?.deviation?.plan) === JSON.stringify([7, 8, 9]) &&
+      snapB.body?.performance?.deviation?.prefix?.status === 'exceeded' &&
+      snapB.body?.performance?.version === 4,
+    JSON.stringify(snapB.body));
+}
+
+// --- 7d: the plan is fixed at creation and ignores later drafts/commands --
+{
+  const fixedId = commandRequestId('vp-fixed');
+  const create = await sendCommand(WEB_URL, {
+    command: 'create', name: '计划固定', plan: [5, 6], k: 1, requestId: fixedId,
+  });
+  const id = create.body.performance.id;
+  // Replaying the same committed create id with a DIFFERENT plan is a
+  // duplicate anchored at the original session; it creates nothing and the
+  // original plan is unchanged.
+  const replay = await sendCommand(WEB_URL, {
+    command: 'create', name: '伪装改计划', plan: [9], k: 0, requestId: fixedId,
+  });
+  check('plan-changing create replay -> DUPLICATE_REQUEST',
+    replay.status === 409 && replay.body?.error?.reason === 'DUPLICATE_REQUEST' &&
+      replay.body?.error?.message?.includes(id),
+    JSON.stringify(replay.body));
+  const snap = await getPerformance(WEB_URL, id);
+  check('fixed plan is unchanged after the foreign replay',
+    JSON.stringify(snap.body?.performance?.deviation?.plan) === JSON.stringify([5, 6]) &&
+      snap.body?.performance?.deviation?.k === 1,
+    JSON.stringify(snap.body));
+}
+
+// --- 7e: legacy sessions without plan/k keep deviation null ---------------
+{
+  const create = await sendCommand(WEB_URL, {
+    command: 'create', name: '旧场次兼容', requestId: commandRequestId('vleg-create'),
+  });
+  check('legacy create has no deviation field',
+    create.status === 200 && create.body?.performance?.deviation === null,
+    JSON.stringify(create.body));
+  const id = create.body.performance.id;
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('vleg-start'),
+  });
+  const cue = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 321,
+    expectedVersion: 2, requestId: commandRequestId('vleg-cue'),
+  });
+  check('legacy cue stays on the old snapshot shape (deviation null)',
+    cue.status === 200 && cue.body?.performance?.cues?.length === 1 &&
+      cue.body?.performance?.deviation === null,
+    JSON.stringify(cue.body));
+  const reloaded = await getPerformance(WEB_URL, id);
+  check('legacy reload keeps deviation null',
+    reloaded.body?.performance?.deviation === null &&
+      JSON.stringify(reloaded.body?.performance?.cues) === JSON.stringify([321]),
+    JSON.stringify(reloaded.body));
+}
+
+// --- 7f: planned-create envelope validation -------------------------------
+{
+  const cases = [
+    [{ command: 'create', name: 'x', plan: [1], requestId: commandRequestId('venv-1') }, 'INVALID_BODY'],
+    [{ command: 'create', name: 'x', k: 1, requestId: commandRequestId('venv-2') }, 'INVALID_BODY'],
+    [{ command: 'create', name: 'x', plan: [1.5], k: 1, requestId: commandRequestId('venv-3') }, 'INVALID_ELEMENT'],
+    [{ command: 'create', name: 'x', plan: 'nope', k: 1, requestId: commandRequestId('venv-4') }, 'INVALID_BODY'],
+    [{ command: 'create', name: 'x', plan: [], k: 501, requestId: commandRequestId('venv-5') }, 'INVALID_K'],
+    [{ command: 'create', name: 'x', plan: new Array(50_001).fill(0), k: 500, requestId: commandRequestId('venv-6') }, 'ARRAY_TOO_LONG'],
+  ];
+  for (const [payload, code] of cases) {
+    const res = await sendCommand(WEB_URL, payload);
+    expectError(`planned create rejection ${code}`, res, 400, code);
+  }
+  // An empty plan with k = 0 is a legitimate fixed plan.
+  const empty = await sendCommand(WEB_URL, {
+    command: 'create', name: '空计划合法', plan: [], k: 0,
+    requestId: commandRequestId('venv-empty'),
+  });
+  check('empty plan with k=0 accepted with prefix distance 0',
+    empty.status === 200 &&
+      JSON.stringify(empty.body?.performance?.deviation?.plan) === '[]' &&
+      empty.body?.performance?.deviation?.prefix?.distance === 0,
+    JSON.stringify(empty.body));
+}
+
+console.log('\n[8] published WEB_PORT override');
 {
   const webPort = process.env.WEB_PORT ?? '8080';
   // In compose the published host port is reached via host-gateway; a local

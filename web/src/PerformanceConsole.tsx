@@ -1,5 +1,5 @@
 import { ConsoleStore, useStore, type ConsoleError } from './stores';
-import type { Performance, PerformanceStatus } from './api';
+import type { Performance, PerformanceDeviation, PerformanceStatus } from './api';
 
 const STATUS_LABELS: Record<PerformanceStatus, string> = {
   pending: '待演',
@@ -31,6 +31,38 @@ export default function PerformanceConsole({ store }: { store: ConsoleStore }) {
             </button>
           </span>
         </label>
+        <details className="plan-create">
+          <summary>
+            可选：固定计划 cue 序列与容许距离 K（留空即旧流程；计划创建后不再随本表单改变）
+          </summary>
+          <label className="field">
+            <span>计划 cue 序列（JSON 整数数组，≤ 50000 项）</span>
+            <textarea
+              className="plan-input"
+              value={s.planDraft}
+              onChange={(e) => store.setPlanDraft(e.target.value)}
+              placeholder="[101, 102, 103]（留空则不启用偏差追踪）"
+              spellCheck={false}
+              rows={3}
+              disabled={s.commandBusy}
+            />
+          </label>
+          <label className="field">
+            <span>容许距离 K（0–500，与计划同时填写）</span>
+            <span className="field-row">
+              <input
+                type="number"
+                min={0}
+                max={500}
+                step={1}
+                value={s.planKDraft}
+                onChange={(e) => store.setPlanKDraft(e.target.value)}
+                placeholder="如 3"
+                disabled={s.commandBusy}
+              />
+            </span>
+          </label>
+        </details>
         <label className="field">
           <span>按 ID 载入快照</span>
           <span className="field-row">
@@ -91,6 +123,10 @@ export default function PerformanceConsole({ store }: { store: ConsoleStore }) {
               </dd>
             </div>
           </dl>
+
+          {session.deviation && (
+            <DeviationCard deviation={session.deviation} status={session.status} version={session.version} />
+          )}
 
           {session.status === 'pending' && (
             <div className="actions">
@@ -201,5 +237,77 @@ function Timeline({ session }: { session: Performance }) {
       )}
       {sealed && <p className="sealed-note">场次已结束，时间线封存，不再接受写入。</p>}
     </div>
+  );
+}
+
+/**
+ * The deviation verdict. Everything rendered here comes from the single
+ * snapshot `session` (plan, prefix/final readings and version together), so
+ * a tab switch or a late response can never mix a plan from one version with
+ * a verdict from another: this card has no independent data source.
+ */
+function DeviationCard({
+  deviation,
+  status,
+  version,
+}: {
+  deviation: PerformanceDeviation;
+  status: PerformanceStatus;
+  version: number;
+}) {
+  const sealed = status === 'ended';
+  const live = sealed ? deviation.final : deviation.prefix;
+  const within = live.status === 'ok';
+  return (
+    <section
+      className={`deviation-card ${within ? 'verdict ok' : 'verdict exceeded'}`}
+      role="status"
+      aria-live="polite"
+    >
+      <h2>
+        {sealed
+          ? within
+            ? '✅ 终局：偏差在容许范围内'
+            : '⚠️ 终局：偏差超出容许范围'
+          : within
+            ? '✅ 仍可追回'
+            : '⚠️ 已超出容许范围（无法追回）'}
+      </h2>
+      <p className="headline">
+        {sealed ? '与完整计划的最终距离：' : '与计划各前缀的最小偏差：'}
+        {live.status === 'ok' ? (
+          <>
+            <strong>{live.distance}</strong> ≤ 容许距离 K = {deviation.k}
+          </>
+        ) : (
+          <>实际偏差距离大于容许距离 K = {deviation.k}（服务仅返回 exceeded 信号）</>
+        )}
+      </p>
+      <dl className="facts">
+        <div>
+          <dt>计划长度</dt>
+          <dd>{deviation.planLength}</dd>
+        </div>
+        <div>
+          <dt>容许距离 K</dt>
+          <dd>{deviation.k}</dd>
+        </div>
+        <div>
+          <dt>完整计划距离</dt>
+          <dd>{deviation.final.status === 'ok' ? deviation.final.distance : '超限'}</dd>
+        </div>
+        <div>
+          <dt>判定版本</dt>
+          <dd>{version}</dd>
+        </div>
+      </dl>
+      <p className="deviation-attribution">
+        偏差提示、接口快照与控制台时间线同属版本 <strong>{version}</strong>；计划创建后固定。
+      </p>
+      <details>
+        <summary>复核：固定计划 cue 序列</summary>
+        <pre>{JSON.stringify(deviation.plan)}</pre>
+      </details>
+    </section>
   );
 }

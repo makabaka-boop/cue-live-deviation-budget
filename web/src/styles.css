@@ -384,6 +384,45 @@ button.danger {
   font-size: 0.8rem;
 }
 
+.plan-create {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px dashed #2c3040;
+  border-radius: 8px;
+  color: #9aa0b0;
+  font-size: 0.85rem;
+}
+
+.plan-create[open] {
+  border-style: solid;
+}
+
+.plan-create summary {
+  cursor: pointer;
+}
+
+.plan-input {
+  width: 100%;
+  resize: vertical;
+  background: #0d0f14;
+  color: #dfe3ee;
+  border: 1px solid #2c3040;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.deviation-card {
+  margin: 16px 0;
+}
+
+.deviation-attribution {
+  color: #9aa0b0;
+  font-size: 0.8rem;
+  margin: 6px 0 0;
+}
+
 /* ------------------------------------------------------------- timeline */
 
 .timeline {

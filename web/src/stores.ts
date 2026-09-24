@@ -92,6 +92,42 @@ function parseK(text: string): number {
   return k;
 }
 
+/**
+ * Parse the optional fixed plan for session creation. Both fields blank =
+ * legacy session (old flow). Exactly one filled, non-JSON, non-array, an
+ * element outside int32, or an out-of-range K is rejected before sending.
+ */
+function parsePlanDraft(
+  planText: string,
+  kText: string,
+): { plan: number[]; k: number } | undefined {
+  const planTrimmed = planText.trim();
+  const kTrimmed = kText.trim();
+  if (planTrimmed === '' && kTrimmed === '') return undefined;
+  if (planTrimmed === '') {
+    throw new ClientError('INVALID_BODY', '填写了容许距离 K 时，必须同时提供计划 cue 序列。');
+  }
+  if (kTrimmed === '') {
+    throw new ClientError('INVALID_BODY', '填写了计划 cue 序列时，必须同时填写容许距离 K。');
+  }
+  const arr = parseJsonArray(planTrimmed, '计划 cue 序列');
+  if (arr.length > 50_000) {
+    throw new ClientError('ARRAY_TOO_LONG', '计划 cue 序列最多 50000 项。');
+  }
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (
+      typeof v !== 'number' ||
+      !Number.isInteger(v) ||
+      v < -2147483648 ||
+      v > 2147483647
+    ) {
+      throw new ClientError('INVALID_ELEMENT', `计划序列第 ${i + 1} 项必须是 32 位有符号整数。`);
+    }
+  }
+  return { plan: arr as number[], k: parseK(kText) };
+}
+
 /** FNV-1a (32 bit) fingerprint so two verdicts can be told apart at a glance. */
 function fingerprint(input: string): string {
   let h = 0x811c9dc5;
@@ -141,6 +177,10 @@ export interface ConsoleState {
   loadIdDraft: string;
   /** Cue text the stage manager typed; it is only consumed on a commit. */
   cueDraft: string;
+  /** Optional fixed-plan text (JSON int array) on the create form. */
+  planDraft: string;
+  /** Optional tolerance K text for the fixed plan. */
+  planKDraft: string;
 }
 
 export interface ConsoleDeps {
@@ -191,6 +231,8 @@ export class ConsoleStore extends Store<ConsoleState> {
       nameDraft: '',
       loadIdDraft: '',
       cueDraft: '',
+      planDraft: '',
+      planKDraft: '',
     });
     this.deps = deps;
   }
@@ -205,6 +247,14 @@ export class ConsoleStore extends Store<ConsoleState> {
 
   setCueDraft(cueDraft: string): void {
     this.patch({ cueDraft });
+  }
+
+  setPlanDraft(planDraft: string): void {
+    this.patch({ planDraft });
+  }
+
+  setPlanKDraft(planKDraft: string): void {
+    this.patch({ planKDraft });
   }
 
   /**
@@ -232,6 +282,7 @@ export class ConsoleStore extends Store<ConsoleState> {
     action: () => Promise<Performance>,
     targetSessionId: string | null,
     cueSessionId?: string,
+    consumeCreateDrafts = false,
   ): void {
     const cmdGen = ++this.commandGeneration;
     const viewGen = ++this.viewGeneration;
@@ -241,6 +292,7 @@ export class ConsoleStore extends Store<ConsoleState> {
     void action().then(
       (snapshot) => {
         const stale = this.viewGeneration !== viewGen;
+        const superseded = this.commandGeneration !== cmdGen;
         this.adoptSnapshot(snapshot, stale);
         if (cueSessionId) {
           this.pendingCueSessions.delete(cueSessionId);
@@ -251,6 +303,14 @@ export class ConsoleStore extends Store<ConsoleState> {
           if (currentId === cueSessionId) {
             this.patch({ cueDraft: '' });
           }
+        }
+        // A create that actually commits freezes the plan: consume the plan
+        // drafts only when this is still the latest view action and the
+        // created session is the one on screen (not replaced by a load or a
+        // newer create). A late/superseded response must not wipe drafts the
+        // stage manager is using for another action.
+        if (consumeCreateDrafts && !stale && !superseded && this.sessionRef?.id === snapshot.id) {
+          this.patch({ planDraft: '', planKDraft: '' });
         }
       },
       (err) => {
@@ -282,10 +342,28 @@ export class ConsoleStore extends Store<ConsoleState> {
       this.patch({ error: { code: 'INVALID_BODY', message: '请填写场次名称。' } });
       return;
     }
+    // Optional fixed plan. Invalid drafts are reported client-side and never
+    // submitted; leaving both blank keeps the legacy no-plan flow. The plan
+    // travels to the server once, at creation, and is immutable afterwards —
+    // later edits to this box change no existing session.
+    let planned: { plan: number[]; k: number } | undefined;
+    try {
+      planned = parsePlanDraft(this.state.planDraft, this.state.planKDraft);
+    } catch (err) {
+      this.patch({ error: toConsoleError(err) });
+      return;
+    }
     this.runCommand(
       () =>
-        this.deps.submit({ command: 'create', name, requestId: this.deps.newRequestId() }),
+        this.deps.submit({
+          command: 'create',
+          name,
+          requestId: this.deps.newRequestId(),
+          ...(planned ? { plan: planned.plan, k: planned.k } : {}),
+        }),
       null,
+      undefined,
+      true,
     );
   }
 

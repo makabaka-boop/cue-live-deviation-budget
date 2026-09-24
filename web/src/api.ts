@@ -22,6 +22,26 @@ export type DistanceResponse = DistanceOk | DistanceExceeded;
 
 export type PerformanceStatus = 'pending' | 'running' | 'paused' | 'ended';
 
+export type DistanceReading =
+  | { status: 'ok'; distance: number }
+  | { status: 'exceeded' };
+
+/**
+ * Per-snapshot deviation verdict. The fixed plan, both readings and the
+ * tolerance all ride the SAME snapshot object as the version, so a view that
+ * shows version v can only ever show the verdict computed at v.
+ * `null` marks a legacy session created without a plan.
+ */
+export interface PerformanceDeviation {
+  k: number;
+  plan: number[];
+  planLength: number;
+  /** min_j distance to the plan prefixes: recoverable while within k. */
+  prefix: DistanceReading;
+  /** distance to the FULL plan: the end-of-show comparison. */
+  final: DistanceReading;
+}
+
 export interface Performance {
   id: string;
   name: string;
@@ -29,10 +49,18 @@ export interface Performance {
   version: number;
   requestId: string | null;
   cues: number[];
+  deviation: PerformanceDeviation | null;
 }
 
 export type PerformanceCommand =
-  | { command: 'create'; name: string; requestId: string }
+  | {
+      command: 'create';
+      name: string;
+      requestId: string;
+      // Optional fixed plan + tolerance; both absent keeps the legacy flow.
+      plan?: number[];
+      k?: number;
+    }
   | {
       command: 'transition';
       performanceId: string;

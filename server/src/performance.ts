@@ -32,10 +32,23 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { PlanDeviation, type DeviationReading } from './plan-deviation.js';
 import { ApiError } from './validation.js';
 
 export const PERFORMANCE_STATUSES = ['pending', 'running', 'paused', 'ended'] as const;
 export type PerformanceStatus = (typeof PERFORMANCE_STATUSES)[number];
+
+/**
+ * Snapshot deviation view. `null` marks a legacy session created without a
+ * plan: the old flow is unchanged and no verdict is ever surfaced for it.
+ */
+export interface PerformanceDeviation {
+  k: number;
+  plan: number[];
+  planLength: number;
+  prefix: DeviationReading;
+  final: DeviationReading;
+}
 
 export interface Performance {
   id: string;
@@ -44,12 +57,33 @@ export interface Performance {
   version: number;
   requestId: string | null;
   cues: number[];
+  deviation: PerformanceDeviation | null;
+}
+
+/**
+ * Internal record: the fixed plan and its incremental DP tracker live here
+ * and never leave the store; snapshots carry only the derived deviation view
+ * plus a copy of the plan.
+ */
+interface SessionRecord {
+  id: string;
+  name: string;
+  status: PerformanceStatus;
+  version: number;
+  requestId: string | null;
+  cues: number[];
+  /** Present only for sessions created with a plan; null = legacy session. */
+  tracker: PlanDeviation | null;
 }
 
 export interface CreateCommand {
   type: 'create';
   name: string;
   requestId: string;
+  /** Fixed planned cue sequence; undefined together with k keeps the old flow. */
+  plan?: number[];
+  /** Tolerance for the fixed plan; 0 is a valid value. */
+  k?: number;
 }
 
 export interface TransitionCommand {
@@ -106,7 +140,7 @@ function rejectDuplicate(requestId: string, ownerId: string): never {
 }
 
 export class PerformanceStore {
-  private readonly sessions = new Map<string, Performance>();
+  private readonly sessions = new Map<string, SessionRecord>();
   private readonly chains = new Map<string, Promise<unknown>>();
   /** Serial chain per requestId: one adjudication per id at a time, globally. */
   private readonly requestChains = new Map<string, Promise<unknown>>();
@@ -189,13 +223,21 @@ export class PerformanceStore {
     }
 
     if (command.type === 'create') {
-      const session: Performance = {
+      // The plan is fixed here, at the single commit point, from the exact
+      // values the envelope carried. No later command and no page draft can
+      // mutate it — the tracker is constructed once and only ever appends.
+      const tracker =
+        command.plan !== undefined && command.k !== undefined
+          ? new PlanDeviation(command.plan, command.k)
+          : null;
+      const session: SessionRecord = {
         id: randomUUID(),
         name: command.name,
         status: 'pending',
         version: 1,
         requestId: command.requestId,
         cues: [],
+        tracker,
       };
       this.sessions.set(session.id, session);
       // Single commit point for creates: the new session and the global
@@ -242,6 +284,11 @@ export class PerformanceStore {
         );
       }
       session.cues.push(command.cue);
+      // The DP frontier advances inside the same commit point as the cue
+      // append: a committed cue always moves the distance boundary exactly
+      // once, and a rejected throw above never reaches this line, so a
+      // refused cue cannot advance the deviation state.
+      session.tracker?.advance(command.cue);
     }
 
     // Single commit point: version bump and request-id recording happen
@@ -252,7 +299,18 @@ export class PerformanceStore {
     return this.snapshot(session);
   }
 
-  private snapshot(session: Performance): Performance {
-    return { ...session, cues: [...session.cues] };
+  private snapshot(session: SessionRecord): Performance {
+    return {
+      id: session.id,
+      name: session.name,
+      status: session.status,
+      version: session.version,
+      requestId: session.requestId,
+      cues: [...session.cues],
+      // The view (including the fixed plan copy) is derived from the same
+      // committed record and version as every other snapshot field, so a
+      // client displaying one snapshot always sees a single-version answer.
+      deviation: session.tracker ? session.tracker.view() : null,
+    };
   }
 }

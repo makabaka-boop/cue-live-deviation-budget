@@ -6,6 +6,11 @@
    可在运行与暂停间切换，运行时逐条登记整数 cue，结束后查看**封存的只读时间线**。
    所有变更携带 `expectedVersion`（乐观并发）与 `requestId`（请求去重），
    经单场次串行裁决后一次提交；被拒绝时数据与版本保持不变。
+   创建场次时可**选填**一份固定的计划 cue 序列与容许距离 K：此后每条成功
+   提交的现场 cue 都会增量更新「与计划各前缀的最小偏差」边界，边界 ≤ K 时
+   提示**仍可追回**，超过 K 即**已超出容许范围（无法追回，且不会回落）**；
+   结束场次时改用**与完整计划的距离**给出终局结论。未填写计划的旧场次完全
+   沿用原流程（快照中无偏差字段）。
 2. **Cue 序列偏差校验**：在开演间隙核对**计划 cue 序列**与**现场触发序列**
    的偏差是否在容许阈值内。序列为 32 位有符号整数数组（各 ≤ 50000 项），
    阈值 K 为 0–500 的整数。
@@ -21,6 +26,18 @@
   - 内存 O(m)：两行滚动数组（约 400 KB），**不构造 O(nm) 矩阵**；
   - 长度差 |n − m| > K 时直接判定超限；
   - 不调用任何差异比较库。
+- 场次内的逐条偏差追踪（`server/src/plan-deviation.ts`）复用同一带状递推：
+  计划 P 在创建时固定，现场序列 A 每提交一条 cue 就追加一行（O(K) 时间、
+  O(|P|) 两行内存）。
+  - **边界（运行中）**= 当前行对计划**各前缀**距离的最小值
+    `min_j D(A, P[0..j))`；≤ K 为「仍可追回」，否则「已超出容许范围」。
+    追加元素不可能降低该前缀最小值（最优对齐脚本删去最后一个现场元素
+    至多再花 1 个删除），所以边界**单调不减**，一旦超限永不回落。
+  - **终局（结束后）**= 对**完整计划**的距离 `D(A, P)`，同样在每条
+    cue 提交时随快照给出，≤ K 给精确值，否则只给 `exceeded`。
+  - 追踪器仅在 cue **成功提交**的同一提交点推进一次；请求标识重放、
+    版本冲突、非法迁移、非运行态写入、非法信封都在抵达 DP 前被拒绝，
+    距离状态、版本与 cue 三者同进同退。
 
 ## 服务组成
 
@@ -28,7 +45,7 @@
 | -------- | ---- |
 | `server` | Fastify API（容器内 3000 端口）：距离校验 + 场次命令裁决（内存存储） |
 | `web`    | React 静态页 + nginx `/api` 反向代理，宿主端口由 `WEB_PORT` 覆盖（默认 8080） |
-| `verify` | 一次性验收服务：参考值、5 万项样本、越界结论、场次全生命周期（经 Web 代理）、同步屏障交错的跨场次全局 requestId 去重（两场次 / 创建与修改 / 已提交后换目标）、宿主端口覆盖 |
+| `verify` | 一次性验收服务：参考值、5 万项样本、越界结论、场次全生命周期（经 Web 代理）、同步屏障交错的跨场次全局 requestId 去重（两场次 / 创建与修改 / 已提交后换目标）、计划场次逐条边界对完整 DP 预言机与终局结论（暂停 / 重试 / 重放 / 冲突 / 跨场次 / 旧场次兼容）、宿主端口覆盖 |
 
 ## 运行（Docker Compose）
 
@@ -86,7 +103,8 @@ docker compose up --build --exit-code-from verify verify
 ## 演出场次 API
 
 会话保存在服务端内存中（单实例）。场次字段：`id`、`name`、`status`、
-`version`、`requestId`（最近一次已提交命令的请求标识）、有序 `cues`。
+`version`、`requestId`（最近一次已提交命令的请求标识）、有序 `cues`、
+`deviation`（仅创建时带计划的场次存在；旧场次为 `null`）。
 
 状态机（非法迁移一律拒绝）：
 
@@ -105,6 +123,17 @@ pending ──▶ running ◀──▶ paused
 
 ```json
 { "command": "create", "name": "9 月 17 日晚场", "requestId": "uuid-1" }
+```
+
+可**选填**固定计划与容许距离；`plan` 与 `k` 必须同时给出或同时省略
+（只给其一返回 400 `INVALID_BODY`）。`plan` 为 32 位有符号整数数组
+（≤ 50000 项，超限 `ARRAY_TOO_LONG`，元素非法 `INVALID_ELEMENT`），
+`k` 为 0–500 整数（非法 `INVALID_K`）。计划一旦随创建提交即固定，
+之后没有任何命令可以修改它：
+
+```json
+{ "command": "create", "name": "9 月 17 日晚场",
+  "plan": [101, 102, 103, 104, 105], "k": 3, "requestId": "uuid-1" }
 ```
 
 状态推进（`status` ∈ `running` / `paused` / `ended`）：
@@ -126,8 +155,17 @@ pending ──▶ running ◀──▶ paused
 ```json
 { "status": "ok",
   "performance": { "id": "...", "name": "...", "status": "running",
-    "version": 3, "requestId": "uuid-3", "cues": [101] } }
+    "version": 3, "requestId": "uuid-3", "cues": [101],
+    "deviation": { "k": 3, "plan": [101, 102, 103, 104, 105], "planLength": 5,
+      "prefix": { "status": "ok", "distance": 0 },
+      "final": { "status": "ok", "distance": 4 } } } }
 ```
+
+`deviation` 只属于带计划创建的场次（旧场次为 `null`）。它和 `version`、
+`cues` 出自同一次提交：`plan` 是创建时固定的计划副本，`prefix` 是与计划
+各前缀的最小距离（运行中据此判定仍可追回/已超限），`final` 是与完整计划
+的距离（结束终局据此判定）；距离 ≤ K 时为 `{ "status": "ok", "distance" }`，
+否则仅为 `{ "status": "exceeded" }`。
 
 裁决规则（命令先经**全局 requestId 串行槽**，再进入该场次的串行队列，
 在槽内原子完成「读取—校验—写入」，要么提交一次，要么拒绝且数据、版本不变）：
@@ -135,6 +173,8 @@ pending ──▶ running ◀──▶ paused
 - `expectedVersion` 与当前版本不一致 → `VERSION_CONFLICT`；
 - 状态不在合法迁移表内 → `ILLEGAL_TRANSITION`；
 - 非 `running` 态登记 cue → `NOT_RUNNING`；
+- 逐条偏差边界只在 `registerCue` **成功提交**时推进；上述任何拒绝、
+  非法信封（400）以及已提交标识的重放都不会触碰偏差状态；
 - `requestId` **在整个服务生命周期内全局唯一**：同一标识无论打向哪个场次
   （或用于创建），都只对应一次成功提交。已提交标识的任何重放——换另一场次、
   换一个不存在的场次、或改作创建命令——一律返回 `DUPLICATE_REQUEST`，拒绝信息
@@ -161,6 +201,7 @@ React 端唯一的读入口，按 ID 载入快照（刷新页面后据此恢复�
 | 409 | `COMMAND_REJECTED` | `DUPLICATE_REQUEST` | 请求标识重复 |
 | 409 | `COMMAND_REJECTED` | `VERSION_CONFLICT` | `expectedVersion` 过期 |
 | 400 | `INVALID_BODY` / `INVALID_CUE` / `INVALID_JSON` | — | 命令信封非法 |
+| 400 | `INVALID_ELEMENT` / `ARRAY_TOO_LONG` / `INVALID_K` | — | 创建时所带 `plan`/`k` 非法（成对规则、元素、长度、阈值），不创建场次 |
 
 错误体形如 `{ "error": { "code": "COMMAND_REJECTED", "reason": "VERSION_CONFLICT", "message": "..." } }`。
 
