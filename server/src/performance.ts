@@ -32,10 +32,24 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { PrefixDistanceTracker, type DeviationSnapshot } from './prefix-distance.js';
 import { ApiError } from './validation.js';
 
 export const PERFORMANCE_STATUSES = ['pending', 'running', 'paused', 'ended'] as const;
 export type PerformanceStatus = (typeof PERFORMANCE_STATUSES)[number];
+
+/**
+ * The planned cue sequence fixed at creation. Once a session exists this
+ * never changes: page drafts edited afterwards can only feed a *new* create
+ * command, never this plan.
+ */
+export interface PlannedCueSequence {
+  cues: number[];
+  k: number;
+}
+
+/** Serializable per-version deviation state (see prefix-distance.ts). */
+export type DeviationState = DeviationSnapshot;
 
 export interface Performance {
   id: string;
@@ -44,12 +58,23 @@ export interface Performance {
   version: number;
   requestId: string | null;
   cues: number[];
+  /** Null for sessions created without a plan — those keep the old flow. */
+  plan: PlannedCueSequence | null;
+  /** Null exactly when plan is null. */
+  deviation: DeviationState | null;
+}
+
+/** The live aggregate: the mutable frontier tracker never leaves the store. */
+interface Session extends Performance {
+  tracker: PrefixDistanceTracker | null;
 }
 
 export interface CreateCommand {
   type: 'create';
   name: string;
   requestId: string;
+  /** Null creates a legacy session with no deviation tracking. */
+  plan: PlannedCueSequence | null;
 }
 
 export interface TransitionCommand {
@@ -106,7 +131,7 @@ function rejectDuplicate(requestId: string, ownerId: string): never {
 }
 
 export class PerformanceStore {
-  private readonly sessions = new Map<string, Performance>();
+  private readonly sessions = new Map<string, Session>();
   private readonly chains = new Map<string, Promise<unknown>>();
   /** Serial chain per requestId: one adjudication per id at a time, globally. */
   private readonly requestChains = new Map<string, Promise<unknown>>();
@@ -189,13 +214,19 @@ export class PerformanceStore {
     }
 
     if (command.type === 'create') {
-      const session: Performance = {
+      // The plan is frozen into the aggregate here and never copied out of
+      // a later request: page-draft changes after creation cannot reach it.
+      const tracker = command.plan ? new PrefixDistanceTracker(command.plan.cues, command.plan.k) : null;
+      const session: Session = {
         id: randomUUID(),
         name: command.name,
         status: 'pending',
         version: 1,
         requestId: command.requestId,
         cues: [],
+        plan: command.plan ? { cues: [...command.plan.cues], k: command.plan.k } : null,
+        deviation: tracker ? tracker.snapshot() : null,
+        tracker,
       };
       this.sessions.set(session.id, session);
       // Single commit point for creates: the new session and the global
@@ -234,6 +265,12 @@ export class PerformanceStore {
         );
       }
       session.status = command.status;
+      // Sealing compares the whole live sequence with the *whole* fixed
+      // plan; a rejected transition (above) throws before reaching here, so
+      // the verdict is produced exactly once and never rolls back.
+      if (command.status === 'ended' && session.tracker) {
+        session.tracker.finalize();
+      }
     } else {
       if (session.status !== 'running') {
         reject(
@@ -242,6 +279,9 @@ export class PerformanceStore {
         );
       }
       session.cues.push(command.cue);
+      // Exactly one frontier step per accepted cue — rejected commands
+      // throw above and never advance the distance state.
+      session.tracker?.append(command.cue);
     }
 
     // Single commit point: version bump and request-id recording happen
@@ -249,10 +289,20 @@ export class PerformanceStore {
     session.version += 1;
     session.requestId = command.requestId;
     this.committedRequests.set(command.requestId, session.id);
+    if (session.tracker) session.deviation = session.tracker.snapshot();
     return this.snapshot(session);
   }
 
-  private snapshot(session: Performance): Performance {
-    return { ...session, cues: [...session.cues] };
+  private snapshot(session: Session): Performance {
+    return {
+      id: session.id,
+      name: session.name,
+      status: session.status,
+      version: session.version,
+      requestId: session.requestId,
+      cues: [...session.cues],
+      plan: session.plan ? { cues: [...session.plan.cues], k: session.plan.k } : null,
+      deviation: session.deviation ? { ...session.deviation, final: session.deviation.final ? { ...session.deviation.final } : null } : null,
+    };
   }
 }

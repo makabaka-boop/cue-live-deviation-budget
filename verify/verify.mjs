@@ -465,6 +465,366 @@ let perfId;
   );
 }
 
+// ------------------------------------------------- planned-session tracking
+//
+// A create may fix a planned cue sequence + tolerance k. Each committed
+// live cue must update the incremental prefix-distance frontier: the
+// boundary is min over planned prefixes of the distance from the whole live
+// prefix heard so far; boundary <= k means "still recoverable". Ending
+// compares the whole live sequence with the whole plan. Rejected commands
+// (version conflict / non-running) and request-id replays must never move
+// the frontier. A short-sequence full-DP oracle checks every boundary.
+
+function fullEditDistance(a, b) {
+  const n = a.length;
+  const m = b.length;
+  const d = [];
+  for (let i = 0; i <= n; i++) {
+    d.push(new Array(m + 1).fill(0));
+    d[i][0] = i;
+  }
+  for (let j = 0; j <= m; j++) d[0][j] = j;
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      d[i][j] = Math.min(
+        d[i - 1][j] + 1,
+        d[i][j - 1] + 1,
+        d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 2),
+      );
+    }
+  }
+  return d;
+}
+
+function oracleBoundary(table, i, m, k) {
+  let min = Infinity;
+  for (let j = 0; j <= m; j++) min = Math.min(min, table[i][j]);
+  return Math.min(min, k + 1);
+}
+
+console.log('\n[5b] planned session: per-cue frontier, final verdict and no-advance rejections');
+{
+  // Two stray cues (9, 8) against plan [1..4] cannot both be deleted within
+  // k = 1; the frontier flips to unrecoverable after the second stray and
+  // never recovers even after the remaining plan arrives perfectly.
+  const plan = [1, 2, 3, 4];
+  const live = [1, 2, 9, 8, 3, 4];
+  const K = 1;
+  const table = fullEditDistance(live, plan);
+
+  const create = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '计划场次-边界',
+    requestId: commandRequestId('plan-create'),
+    planCues: plan,
+    k: K,
+  });
+  check(
+    'planned create -> pending v1 with sealed plan + zero-cue boundary',
+    create.status === 200 &&
+      create.body?.performance?.status === 'pending' &&
+      create.body?.performance?.version === 1 &&
+      JSON.stringify(create.body?.performance?.plan?.cues) === JSON.stringify(plan) &&
+      create.body?.performance?.plan?.k === K &&
+      create.body?.performance?.deviation?.liveLength === 0 &&
+      create.body?.performance?.deviation?.boundary === 0 &&
+      create.body?.performance?.deviation?.recoverable === true &&
+      create.body?.performance?.deviation?.final === null,
+    `got ${create.status} ${JSON.stringify(create.body)}`,
+  );
+  const id = create.body.performance.id;
+
+  let start = await sendCommand(WEB_URL, {
+    command: 'transition',
+    performanceId: id,
+    status: 'running',
+    expectedVersion: 1,
+    requestId: commandRequestId('plan-start'),
+  });
+  check('planned session running v2', start.status === 200 &&
+    start.body?.performance?.version === 2, `got ${start.status}`);
+
+  let lastVersion = 2;
+  let flipVersion = null;
+  for (let i = 0; i < live.length; i++) {
+    const expectedVersion = lastVersion;
+    const res = await sendCommand(WEB_URL, {
+      command: 'registerCue',
+      performanceId: id,
+      cue: live[i],
+      expectedVersion,
+      requestId: commandRequestId(`plan-cue-${i}`),
+    });
+    const dev = res.body?.performance?.deviation;
+    const wantBoundary = oracleBoundary(table, i + 1, plan.length, K);
+    const wantRecoverable = wantBoundary <= K;
+    check(
+      `cue #${i + 1} (${live[i]}) frontier matches full-DP oracle (boundary ${wantBoundary}, ${wantRecoverable ? 'recoverable' : 'exceeded'})`,
+      res.status === 200 &&
+        res.body?.performance?.version === expectedVersion + 1 &&
+        dev?.liveLength === i + 1 &&
+        dev?.boundary === wantBoundary &&
+        dev?.recoverable === wantRecoverable &&
+        dev?.final === null &&
+        // The plan is echoed unchanged on every version.
+        JSON.stringify(res.body?.performance?.plan?.cues) === JSON.stringify(plan),
+      `got ${res.status} ${JSON.stringify(res.body)} (want boundary ${wantBoundary})`,
+    );
+    lastVersion = expectedVersion + 1;
+    if (!wantRecoverable && flipVersion === null) flipVersion = lastVersion;
+  }
+  check('frontier flipped unrecoverable exactly once (after the second stray cue)', flipVersion === 6,
+    `flipVersion=${flipVersion}`);
+
+  // Stale-version cue: rejected, frontier and version must not move.
+  const beforeStale = (await getPerformance(WEB_URL, id)).body.performance;
+  const stale = await sendCommand(WEB_URL, {
+    command: 'registerCue',
+    performanceId: id,
+    cue: 123,
+    expectedVersion: 2, // far behind current version
+    requestId: commandRequestId('plan-stale'),
+  });
+  check(
+    'stale cue rejected VERSION_CONFLICT with frontier untouched',
+    stale.status === 409 && stale.body?.error?.reason === 'VERSION_CONFLICT',
+    `got ${stale.status} ${JSON.stringify(stale.body)}`,
+  );
+  const afterStale = (await getPerformance(WEB_URL, id)).body.performance;
+  check(
+    'rejected cue changed neither version nor deviation',
+    afterStale.version === beforeStale.version &&
+      JSON.stringify(afterStale.deviation) === JSON.stringify(beforeStale.deviation) &&
+      JSON.stringify(afterStale.cues) === JSON.stringify(beforeStale.cues),
+    `before ${JSON.stringify({ v: beforeStale.version, d: beforeStale.deviation })} after ${JSON.stringify({ v: afterStale.version, d: afterStale.deviation })}`,
+  );
+
+  // Pause -> NOT_RUNNING cue must not advance; resume -> cue advances; end
+  // from a second pause must produce the whole-plan final verdict.
+  const pause = await sendCommand(WEB_URL, {
+    command: 'transition',
+    performanceId: id,
+    status: 'paused',
+    expectedVersion: lastVersion,
+    requestId: commandRequestId('plan-pause'),
+  });
+  check('pause ok', pause.status === 200 &&
+    pause.body?.performance?.status === 'paused', `got ${pause.status}`);
+  lastVersion += 1;
+
+  const whilePaused = await sendCommand(WEB_URL, {
+    command: 'registerCue',
+    performanceId: id,
+    cue: 777,
+    expectedVersion: lastVersion,
+    requestId: commandRequestId('plan-paused-write'),
+  });
+  check(
+    'cue while paused rejected NOT_RUNNING, frontier frozen',
+    whilePaused.status === 409 &&
+      whilePaused.body?.error?.reason === 'NOT_RUNNING' &&
+      (await getPerformance(WEB_URL, id)).body.performance.deviation.liveLength === live.length,
+    `got ${whilePaused.status} ${JSON.stringify(whilePaused.body)}`,
+  );
+
+  const resume = await sendCommand(WEB_URL, {
+    command: 'transition',
+    performanceId: id,
+    status: 'running',
+    expectedVersion: lastVersion,
+    requestId: commandRequestId('plan-resume'),
+  });
+  check('resume ok', resume.status === 200 &&
+    resume.body?.performance?.deviation?.liveLength === live.length, `got ${resume.status}`);
+  lastVersion += 1;
+
+  // Same request id as the paused rejection: still reusable after the
+  // precondition is corrected (one frontier step, then one more).
+  const retryId = commandRequestId('plan-paused-retry');
+  const afterResume = await sendCommand(WEB_URL, {
+    command: 'registerCue',
+    performanceId: id,
+    cue: 5,
+    expectedVersion: lastVersion,
+    requestId: retryId,
+  });
+  check(
+    'rejected id reused after resume commits once (liveLength + 1)',
+    afterResume.status === 200 &&
+      afterResume.body?.performance?.deviation?.liveLength === live.length + 1,
+    `got ${afterResume.status} ${JSON.stringify(afterResume.body)}`,
+  );
+  lastVersion += 1;
+  const replay = await sendCommand(WEB_URL, {
+    command: 'registerCue',
+    performanceId: id,
+    cue: 6,
+    expectedVersion: lastVersion,
+    requestId: retryId,
+  });
+  check(
+    'replaying the now-committed id is DUPLICATE_REQUEST and does not advance',
+    replay.status === 409 && replay.body?.error?.reason === 'DUPLICATE_REQUEST' &&
+      (await getPerformance(WEB_URL, id)).body.performance.deviation.liveLength === live.length + 1,
+    `got ${replay.status} ${JSON.stringify(replay.body)}`,
+  );
+
+  // Seal directly from paused; the final comparison is against the WHOLE
+  // plan (the oracle's full-table bottom-right), not the min-prefix bound.
+  await sendCommand(WEB_URL, {
+    command: 'transition',
+    performanceId: id,
+    status: 'paused',
+    expectedVersion: lastVersion,
+    requestId: commandRequestId('plan-pause2'),
+  });
+  lastVersion += 1;
+  const end = await sendCommand(WEB_URL, {
+    command: 'transition',
+    performanceId: id,
+    status: 'ended',
+    expectedVersion: lastVersion,
+    requestId: commandRequestId('plan-end'),
+  });
+  const exactFinal = table[live.length][plan.length];
+  const wantFinal = exactFinal <= K ? { status: 'ok', distance: exactFinal } : { status: 'exceeded' };
+  check(
+    'end compares whole live run with whole plan (oracle final verdict)',
+    end.status === 200 &&
+      end.body?.performance?.status === 'ended' &&
+      JSON.stringify(end.body?.performance?.deviation?.final) === JSON.stringify(wantFinal),
+    `got ${end.status} final=${JSON.stringify(end.body?.performance?.deviation?.final)} want ${JSON.stringify(wantFinal)}`,
+  );
+  check('whole-plan final here is exceeded (two stray deletions, k=1)', exactFinal > K,
+    `exactFinal=${exactFinal}`);
+}
+
+// A plan within budget end to end: exact final distance is reported.
+{
+  const plan = [101, 102, 103];
+  const live = [101, 102, 205, 103]; // one extra cue -> distance 1
+  const create = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '计划场次-可追回',
+    requestId: commandRequestId('planok-create'),
+    planCues: plan,
+    k: 2,
+  });
+  const id = create.body.performance.id;
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('planok-start'),
+  });
+  let v = 2;
+  for (let i = 0; i < live.length; i++) {
+    const res = await sendCommand(WEB_URL, {
+      command: 'registerCue', performanceId: id, cue: live[i],
+      expectedVersion: v, requestId: commandRequestId(`planok-cue-${i}`),
+    });
+    check(`recoverable session cue #${i + 1} stays recoverable`,
+      res.status === 200 && res.body?.performance?.deviation?.recoverable === true,
+      JSON.stringify(res.body));
+    v += 1;
+  }
+  const end = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'ended',
+    expectedVersion: v, requestId: commandRequestId('planok-end'),
+  });
+  check(
+    'recoverable whole-plan final reports exact distance 1',
+    end.status === 200 &&
+      JSON.stringify(end.body?.performance?.deviation?.final) === JSON.stringify({ status: 'ok', distance: 1 }),
+    `got ${JSON.stringify(end.body?.performance?.deviation?.final)}`,
+  );
+}
+
+// Legacy session (no plan): plan/deviation stay null across the lifecycle.
+{
+  const create = await sendCommand(WEB_URL, {
+    command: 'create',
+    name: '旧场次兼容',
+    requestId: commandRequestId('legacy-create'),
+  });
+  const id = create.body.performance.id;
+  check('legacy create has null plan/deviation',
+    create.status === 200 && create.body?.performance?.plan === null &&
+      create.body?.performance?.deviation === null,
+    JSON.stringify(create.body));
+  await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'running',
+    expectedVersion: 1, requestId: commandRequestId('legacy-start'),
+  });
+  const cue = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: id, cue: 1,
+    expectedVersion: 2, requestId: commandRequestId('legacy-cue'),
+  });
+  const end = await sendCommand(WEB_URL, {
+    command: 'transition', performanceId: id, status: 'ended',
+    expectedVersion: 3, requestId: commandRequestId('legacy-end'),
+  });
+  check('legacy session keeps null plan/deviation through cues and end',
+    cue.body?.performance?.plan === null && cue.body?.performance?.deviation === null &&
+      end.body?.performance?.plan === null && end.body?.performance?.deviation === null,
+    JSON.stringify({ cue: cue.body?.performance?.deviation, end: end.body?.performance?.deviation }));
+}
+
+// Cross-session: two planned sessions keep independent plans/frontiers.
+{
+  const a = await sendCommand(WEB_URL, {
+    command: 'create', name: '计划跨场-A', requestId: commandRequestId('xpa-create'),
+    planCues: [1, 2], k: 0,
+  });
+  const b = await sendCommand(WEB_URL, {
+    command: 'create', name: '计划跨场-B', requestId: commandRequestId('xpb-create'),
+    planCues: [9, 8, 7], k: 5,
+  });
+  for (const [p, label] of [[a, 'a'], [b, 'b']]) {
+    await sendCommand(WEB_URL, {
+      command: 'transition', performanceId: p.body.performance.id, status: 'running',
+      expectedVersion: 1, requestId: commandRequestId(`xp-${label}-start`),
+    });
+  }
+  const badA = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: a.body.performance.id, cue: 5,
+    expectedVersion: 2, requestId: commandRequestId('xp-a-bad'),
+  });
+  const goodB = await sendCommand(WEB_URL, {
+    command: 'registerCue', performanceId: b.body.performance.id, cue: 9,
+    expectedVersion: 2, requestId: commandRequestId('xp-b-good'),
+  });
+  check('cross-session: A k=0 off-plan unrecoverable while B k=5 stays recoverable',
+    badA.body?.performance?.deviation?.recoverable === false &&
+      goodB.body?.performance?.deviation?.recoverable === true &&
+      JSON.stringify(goodB.body?.performance?.plan?.cues) === JSON.stringify([9, 8, 7]),
+    `A=${JSON.stringify(badA.body?.performance?.deviation)} B=${JSON.stringify(goodB.body?.performance?.deviation)}`);
+}
+
+// Plan envelope validation.
+{
+  const half1 = await sendCommand(WEB_URL, {
+    command: 'create', name: '半截计划', requestId: commandRequestId('planv-half1'), planCues: [1],
+  });
+  const half2 = await sendCommand(WEB_URL, {
+    command: 'create', name: '半截计划', requestId: commandRequestId('planv-half2'), k: 2,
+  });
+  const badElem = await sendCommand(WEB_URL, {
+    command: 'create', name: '坏元素', requestId: commandRequestId('planv-elem'),
+    planCues: [1, 'x'], k: 2,
+  });
+  const badK = await sendCommand(WEB_URL, {
+    command: 'create', name: '坏 K', requestId: commandRequestId('planv-k'),
+    planCues: [], k: 501,
+  });
+  check('planCues without k -> INVALID_BODY',
+    half1.status === 400 && half1.body?.error?.code === 'INVALID_BODY', JSON.stringify(half1.body));
+  check('k without planCues -> INVALID_BODY',
+    half2.status === 400 && half2.body?.error?.code === 'INVALID_BODY', JSON.stringify(half2.body));
+  check('non-int plan element -> INVALID_ELEMENT',
+    badElem.status === 400 && badElem.body?.error?.code === 'INVALID_ELEMENT', JSON.stringify(badElem.body));
+  check('k=501 plan -> INVALID_K',
+    badK.status === 400 && badK.body?.error?.code === 'INVALID_K', JSON.stringify(badK.body));
+}
+
 // Rejections must not consume the request id, and paused sessions can be
 // sealed straight to ended without a resume.
 {

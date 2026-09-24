@@ -49,6 +49,49 @@ export default function PerformanceConsole({ store }: { store: ConsoleStore }) {
         </label>
       </div>
 
+      <details className="plan-draft" open={s.planEnabledDraft}>
+        <summary>
+          <label className="plan-toggle">
+            <input
+              type="checkbox"
+              checked={s.planEnabledDraft}
+              onChange={(e) => store.setPlanEnabled(e.target.checked)}
+              disabled={s.commandBusy}
+            />
+            附带固定计划 cue 序列与容许距离 K（可选；创建后封存，不随后续草稿改变）
+          </label>
+        </summary>
+        {s.planEnabledDraft && (
+          <div className="plan-draft-body">
+            <label className="field">
+              <span>计划 cue 序列（JSON 32 位整数数组，≤ 50000 项；可为空数组 []）</span>
+              <textarea
+                className="plan-textarea"
+                value={s.planCuesDraft}
+                onChange={(e) => store.setPlanCuesDraft(e.target.value)}
+                placeholder="[101, 102, 103, 104, 105]"
+                spellCheck={false}
+                rows={4}
+                disabled={s.commandBusy}
+              />
+            </label>
+            <label className="field plan-k-field">
+              <span>容许距离 K（0–500）</span>
+              <input
+                type="number"
+                min={0}
+                max={500}
+                step={1}
+                value={s.planKDraft}
+                onChange={(e) => store.setPlanKDraft(e.target.value)}
+                placeholder="如 3"
+                disabled={s.commandBusy}
+              />
+            </label>
+          </div>
+        )}
+      </details>
+
       {s.commandBusy && (
         <p className="busy-note" role="status">
           命令提交中…即使切换到偏差校验页，结果仍会回到本页场次。
@@ -91,6 +134,8 @@ export default function PerformanceConsole({ store }: { store: ConsoleStore }) {
               </dd>
             </div>
           </dl>
+
+          <DeviationPanel session={session} />
 
           {session.status === 'pending' && (
             <div className="actions">
@@ -176,6 +221,92 @@ function ErrorBanner({ error }: { error: ConsoleError }) {
       <span>{error.message}</span>
       <span className="error-hint">当前场次保留在页面上，数据未被改动。</span>
     </div>
+  );
+}
+
+/**
+ * Per-version deviation hint. Everything shown here is read from the single
+ * session snapshot on screen, so the hint, the version number and the
+ * timeline always describe the same version: a late response for another
+ * session (or an older version) is filtered out before it reaches this view
+ * and can never mix conclusions here.
+ */
+function DeviationPanel({ session }: { session: Performance }) {
+  const { plan, deviation } = session;
+  if (!plan || !deviation) {
+    return (
+      <p className="plan-legacy-note">该场次创建时未附计划 cue 序列，按原流程登记，不做偏差校验。</p>
+    );
+  }
+
+  const ended = session.status === 'ended';
+  const verdictClass = ended
+    ? deviation.final?.status === 'ok'
+      ? 'verdict ok'
+      : 'verdict exceeded'
+    : deviation.recoverable
+      ? 'verdict ok'
+      : 'verdict exceeded';
+
+  return (
+    <section className={verdictClass} role="status" data-version={session.version}>
+      <p className="identity-line">偏差状态归属：场次版本 #{session.version}</p>
+      {ended && deviation.final ? (
+        deviation.final.status === 'ok' ? (
+          <>
+            <h2>✅ 终局：偏差在容许范围内</h2>
+            <p className="headline">
+              完整计划最终距离 <strong>{deviation.final.distance}</strong> ≤ 容许距离 K ={' '}
+              {plan.k}
+            </p>
+          </>
+        ) : (
+          <>
+            <h2>⚠️ 终局：偏差超出容许范围</h2>
+            <p className="headline">
+              完整序列最终距离大于容许距离 K = {plan.k}（仅返回 exceeded 信号）
+            </p>
+          </>
+        )
+      ) : deviation.recoverable ? (
+        <>
+          <h2>✅ 仍可追回</h2>
+          <p className="headline">
+            当前偏差边界 <strong>{deviation.boundary}</strong> ≤ 容许距离 K = {plan.k}
+            ：已登记 {deviation.liveLength} 条现场 cue，至少某一计划前缀仍可在预算内对齐。
+          </p>
+        </>
+      ) : (
+        <>
+          <h2>⚠️ 已超出容许范围</h2>
+          <p className="headline">
+            偏差边界已大于容许距离 K = {plan.k}：继续演出无法再追回（边界只会增长）。
+          </p>
+        </>
+      )}
+      <dl className="facts deviation-facts">
+        <div>
+          <dt>计划 cue</dt>
+          <dd>{deviation.plannedLength}</dd>
+        </div>
+        <div>
+          <dt>现场 cue</dt>
+          <dd>{deviation.liveLength}</dd>
+        </div>
+        <div>
+          <dt>当前边界</dt>
+          <dd>{deviation.boundary > plan.k ? `>${plan.k}` : deviation.boundary}</dd>
+        </div>
+        <div>
+          <dt>容许 K</dt>
+          <dd>{plan.k}</dd>
+        </div>
+      </dl>
+      <details className="plan-sealed">
+        <summary>固定计划（创建时封存，不随页面草稿改变）</summary>
+        <pre>{JSON.stringify(plan.cues)}</pre>
+      </details>
+    </section>
   );
 }
 

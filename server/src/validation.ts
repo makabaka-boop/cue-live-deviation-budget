@@ -68,7 +68,7 @@ export function parseCompareBody(body: unknown): CompareRequest {
   };
 }
 
-function parseInt32Array(value: unknown, field: 'a' | 'b'): number[] {
+function parseInt32Array(value: unknown, field: string): number[] {
   if (!Array.isArray(value)) {
     throw new ApiError(
       'INVALID_BODY',
@@ -98,7 +98,12 @@ function parseInt32Array(value: unknown, field: 'a' | 'b'): number[] {
   return value as number[];
 }
 
+/** Parse k without a field-specific message (used by /api/distance). */
 function parseK(value: unknown): number {
+  return parseKField(value, 'k');
+}
+
+function parseKField(value: unknown, field: string): number {
   if (
     typeof value !== 'number' ||
     !Number.isInteger(value) ||
@@ -107,7 +112,7 @@ function parseK(value: unknown): number {
   ) {
     throw new ApiError(
       'INVALID_K',
-      `Field "k" must be an integer between 0 and ${LIMITS.MAX_K}.`,
+      `Field "${field}" must be an integer between 0 and ${LIMITS.MAX_K}.`,
     );
   }
   return value;
@@ -121,6 +126,7 @@ import {
   PERFORMANCE_STATUSES,
   type PerformanceCommand,
   type PerformanceStatus,
+  type PlannedCueSequence,
 } from './performance.js';
 
 const NAME_MAX_LENGTH = 200;
@@ -180,6 +186,27 @@ function asCue(value: unknown): number {
   return value;
 }
 
+/**
+ * Parse the optional fixed plan on a create command. `planCues` and `k`
+ * travel together: omitting both (or planCues === null) creates a legacy
+ * session with no deviation tracking; supplying exactly one is an envelope
+ * error. An empty cue array is a valid (zero-cue) plan.
+ */
+function parseOptionalPlan(obj: Record<string, unknown>): PlannedCueSequence | null {
+  const hasCues = Object.prototype.hasOwnProperty.call(obj, 'planCues');
+  const hasK = Object.prototype.hasOwnProperty.call(obj, 'k');
+  // Neither field: legacy session, deviation tracking switched off.
+  if (!hasCues && !hasK) return null;
+  // The plan is one indivisible fixed input: half of it cannot be fixed.
+  if (!hasCues || !hasK || obj.planCues === null || obj.k === null || obj.k === undefined) {
+    invalidBody('Fields "planCues" and "k" must be supplied together to fix a plan.');
+  }
+  return {
+    cues: parseInt32Array(obj.planCues, 'planCues'),
+    k: parseKField(obj.k, 'k'),
+  };
+}
+
 export function parsePerformanceCommand(body: unknown): PerformanceCommand {
   const obj = asObject(body);
   const requestId = asNonEmptyString(obj.requestId, 'requestId');
@@ -193,7 +220,7 @@ export function parsePerformanceCommand(body: unknown): PerformanceCommand {
       if (name.length > NAME_MAX_LENGTH) {
         invalidBody(`Field "name" must be at most ${NAME_MAX_LENGTH} characters.`);
       }
-      return { type: 'create', name, requestId };
+      return { type: 'create', name, requestId, plan: parseOptionalPlan(obj) };
     }
     case 'transition': {
       const performanceId = asNonEmptyString(obj.performanceId, 'performanceId');

@@ -454,3 +454,92 @@ button.danger {
   font-size: 0.82rem;
 }
 
+/* ----------------------------------------------------- fixed-plan draft */
+
+.plan-draft {
+  margin: 0 0 18px;
+  border: 1px solid #2c3040;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: #181b23;
+}
+
+.plan-draft summary {
+  cursor: pointer;
+  color: #b9bdca;
+  font-size: 0.88rem;
+  list-style: none;
+}
+
+.plan-draft summary::-webkit-details-marker {
+  display: none;
+}
+
+.plan-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.88rem;
+}
+
+.plan-draft-body {
+  display: grid;
+  grid-template-columns: 1fr 160px;
+  gap: 14px;
+  margin-top: 12px;
+  align-items: start;
+}
+
+@media (max-width: 800px) {
+  .plan-draft-body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.plan-textarea {
+  width: 100%;
+  resize: vertical;
+  background: #0d0f14;
+  color: #dfe3ee;
+  border: 1px solid #2c3040;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.plan-textarea:focus {
+  outline: 2px solid #4f7cff;
+  outline-offset: -1px;
+}
+
+.plan-k-field input {
+  width: 100%;
+  background: #0d0f14;
+  color: #dfe3ee;
+  border: 1px solid #2c3040;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 0.95rem;
+}
+
+.plan-legacy-note {
+  margin: 12px 0;
+  color: #6f7688;
+  font-size: 0.82rem;
+}
+
+/* Per-version deviation hint inside the session card. */
+.session .verdict {
+  margin: 14px 0;
+}
+
+.deviation-facts {
+  margin-bottom: 0;
+  flex-wrap: wrap;
+  gap: 24px;
+}
+
+

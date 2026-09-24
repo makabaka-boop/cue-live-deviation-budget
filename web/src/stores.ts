@@ -84,6 +84,21 @@ function parseJsonArray(text: string, label: string): unknown[] {
   return parsed;
 }
 
+/** Parse a JSON array of 32-bit signed integers (the fixed creation plan). */
+function parseJsonInt32Array(text: string, label: string): number[] {
+  const values = parseJsonArray(text, label);
+  if (values.length > 50_000) {
+    throw new ClientError('ARRAY_TOO_LONG', `${label}最多 50000 项。`);
+  }
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < -2147483648 || v > 2147483647) {
+      throw new ClientError('INVALID_ELEMENT', `${label}第 ${i + 1} 项必须是 32 位有符号整数。`);
+    }
+  }
+  return values as number[];
+}
+
 function parseK(text: string): number {
   const k = Number(text);
   if (text.trim() === '' || !Number.isInteger(k) || k < 0 || k > 500) {
@@ -141,6 +156,14 @@ export interface ConsoleState {
   loadIdDraft: string;
   /** Cue text the stage manager typed; it is only consumed on a commit. */
   cueDraft: string;
+  /**
+   * Optional fixed-plan drafts for the *next* create command. They remain
+   * editable page drafts until a create commits and can never alter the plan
+   * of an already created session.
+   */
+  planEnabledDraft: boolean;
+  planCuesDraft: string;
+  planKDraft: string;
 }
 
 export interface ConsoleDeps {
@@ -191,6 +214,9 @@ export class ConsoleStore extends Store<ConsoleState> {
       nameDraft: '',
       loadIdDraft: '',
       cueDraft: '',
+      planEnabledDraft: false,
+      planCuesDraft: '',
+      planKDraft: '',
     });
     this.deps = deps;
   }
@@ -205,6 +231,18 @@ export class ConsoleStore extends Store<ConsoleState> {
 
   setCueDraft(cueDraft: string): void {
     this.patch({ cueDraft });
+  }
+
+  setPlanEnabled(planEnabledDraft: boolean): void {
+    this.patch({ planEnabledDraft });
+  }
+
+  setPlanCuesDraft(planCuesDraft: string): void {
+    this.patch({ planCuesDraft });
+  }
+
+  setPlanKDraft(planKDraft: string): void {
+    this.patch({ planKDraft });
   }
 
   /**
@@ -282,9 +320,28 @@ export class ConsoleStore extends Store<ConsoleState> {
       this.patch({ error: { code: 'INVALID_BODY', message: '请填写场次名称。' } });
       return;
     }
+    // The plan is parsed from the draft exactly once, at the create
+    // command. It then belongs to the session snapshot; later edits to the
+    // same textarea only affect the *next* create.
+    let planCues: number[] | undefined;
+    let k: number | undefined;
+    if (this.state.planEnabledDraft) {
+      try {
+        planCues = parseJsonInt32Array(this.state.planCuesDraft, '计划 cue 序列');
+        k = parseK(this.state.planKDraft);
+      } catch (err) {
+        this.patch({ error: toConsoleError(err) });
+        return;
+      }
+    }
     this.runCommand(
       () =>
-        this.deps.submit({ command: 'create', name, requestId: this.deps.newRequestId() }),
+        this.deps.submit({
+          command: 'create',
+          name,
+          requestId: this.deps.newRequestId(),
+          ...(planCues !== undefined && k !== undefined ? { planCues, k } : {}),
+        }),
       null,
     );
   }

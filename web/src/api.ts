@@ -22,6 +22,33 @@ export type DistanceResponse = DistanceOk | DistanceExceeded;
 
 export type PerformanceStatus = 'pending' | 'running' | 'paused' | 'ended';
 
+/** Fixed plan sealed at creation (null on legacy sessions without a plan). */
+export interface PlannedCueSequence {
+  cues: number[];
+  k: number;
+}
+
+export interface DeviationFinal {
+  status: 'ok' | 'exceeded';
+  /** Present only with status 'ok': the exact whole-sequence distance. */
+  distance?: number;
+}
+
+/**
+ * Per-version deviation state. `boundary` = min over planned prefixes of the
+ * distance from the whole live prefix heard so far, capped at k + 1.
+ * `recoverable` (boundary <= k) answers "still salvageable"; `final` only
+ * appears once the session has ended and was compared with the whole plan.
+ */
+export interface DeviationState {
+  k: number;
+  plannedLength: number;
+  liveLength: number;
+  boundary: number;
+  recoverable: boolean;
+  final: DeviationFinal | null;
+}
+
 export interface Performance {
   id: string;
   name: string;
@@ -29,10 +56,18 @@ export interface Performance {
   version: number;
   requestId: string | null;
   cues: number[];
+  plan: PlannedCueSequence | null;
+  deviation: DeviationState | null;
 }
 
 export type PerformanceCommand =
-  | { command: 'create'; name: string; requestId: string }
+  | {
+      command: 'create';
+      name: string;
+      requestId: string;
+      planCues?: number[];
+      k?: number;
+    }
   | {
       command: 'transition';
       performanceId: string;
